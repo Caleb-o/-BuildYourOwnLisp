@@ -7,7 +7,7 @@
 *.obj
 *.elf
 
-
+bin/
 build.ps1
 
 # Linker output

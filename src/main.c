@@ -74,101 +74,13 @@ struct lval {
     struct lval **cell;
 };
 
-typedef struct entry_t {
-    char *key;
-    lval *val;
-} entry_t;
-
 /* Lisp environment */
 struct lenv {
     lenv *parent;
     size_t count, capacity;
-    entry_t **entries;
+    char **syms;
+    lval **vals;
 };
-
-
-lval *lval_copy(lval *val);
-void lval_del(lval *val);
-
-entry_t *entry_copy(entry_t *entry) {
-    entry_t *copy = (entry_t *)malloc(sizeof(entry_t));
-    copy->val = lval_copy(entry->val);
-    copy->key = (char *)malloc(strlen(entry->key) + 1);
-
-    strcpy(copy->key, entry->key);
-    return copy;
-}
-
-void entry_del(entry_t *entry) {
-    lval_del(entry->val);
-
-    free(entry->key);
-    free(entry);
-}
-
-/* ====== HASHING ====== */
-/* 
-    NOTE: Hashing functions thanks to the crafting interpreters book
-*/
-
-int lval_hash(lval *key) {
-    int lhash = 2166136261u;
-    
-    for (size_t i = 0; i < strlen(key->sym); ++i) {
-        lhash ^= (int)key->sym[i];
-        lhash *= 16777619;
-    }
-    return lhash;
-}
-
-int lenv_find_index(lenv *env, lval *key) {
-    int index = lval_hash(key) % env->capacity;
-
-    while(1) {
-        if (env->entries[index] == NULL || strcmp(env->entries[index]->key, key->sym) == 0) return index;
-        index = (index + 1) % env->capacity;
-    }
-}
-
-int lenv_insert_value(lenv *env, lval *key, lval *val) {
-    int hash_index = lval_hash(key) % env->capacity;
-    
-    /* Is it a new entry? */
-    if (env->entries[hash_index] == NULL) {
-        printf("Empty value slot at %d\n", hash_index);
-        /* Check for resizing */
-        if (env->count + 1 >= env->capacity) {
-            const size_t oldCap = env->capacity;
-            env->capacity *= 1.75;
-
-            const size_t val_sz = sizeof(entry_t*) * env->capacity;
-            env->entries = (entry_t **)realloc(env->entries, val_sz);
-
-            memory_allocated += val_sz - oldCap;
-
-#ifdef DEBUG
-            printf("values, bytes allocated :: %lld/%lld values, %zu bytes (symbols + values) [%lld bytes total]\n",
-                env->count, 
-                env->capacity, 
-                val_sz, 
-                memory_allocated);
-#endif
-        }
-        /* Increment */
-        env->count++;
-    } else {
-        entry_del(env->entries[hash_index]);
-    }
-
-    /* Finally we insert */
-    /* Note: we don't care too much if we overwrite some things, as longs as all values make it in */
-    entry_t* entry = env->entries[hash_index] = (entry_t *)malloc(sizeof(entry_t));
-    entry->key = (char*)malloc(strlen(key->sym) + 1);
-    entry->val = lval_copy(val);
-
-    strcpy(entry->key, key->sym);
-    return hash_index;
-}
 
 
 char *ltype_name(size_t type) {
@@ -361,7 +273,6 @@ void lval_del(lval *val) {
         }
     }
 
-    
     free(val);
 }
 
@@ -371,12 +282,15 @@ lenv *lenv_new() {
     lenv *env = (lenv *)malloc(sizeof(lenv));
     env->parent = NULL;
     env->count = 0;
-    env->capacity = 128;
+    env->capacity = 32;
 
-    const size_t val_sz = sizeof(entry_t*) * env->capacity;
-    env->entries = (entry_t **)malloc(val_sz);
+    const size_t sym_sz = sizeof(char*) * env->capacity;
+    const size_t val_sz = sizeof(lval*) * env->capacity;
 
-    memory_allocated += val_sz;
+    env->syms = (char **)malloc(sym_sz);
+    env->vals = (lval **)malloc(val_sz);
+
+    memory_allocated += (sym_sz + val_sz);
     return env;
 }
 
@@ -386,34 +300,36 @@ lenv *lenv_copy(lenv *env) {
     copy->count = env->count;
     copy->capacity = env->capacity;
 
-    const size_t val_sz = sizeof(entry_t*) * env->capacity;
-    copy->entries = (entry_t **)malloc(val_sz);
-    memory_allocated += val_sz;
+    copy->syms = (char **)malloc(sizeof(char*) * env->capacity);
+    copy->vals = (lval **)malloc(sizeof(lval*) * env->capacity);
 
     for (size_t i = 0; i < env->count; ++i) {
-        copy->entries[i] = entry_copy(env->entries[i]);
+        copy->syms[i] = (char *)malloc(strlen(env->syms[i]) + 1);
+        strcpy(copy->syms[i], env->syms[i]);
+        copy->vals[i] = lval_copy(env->vals[i]);
     }
     return copy;
 }
 
 void lenv_del(lenv *env) {
     for (size_t i = 0; i < env->count; ++i) {
-        entry_del(env->entries[i]);
+        free(env->syms[i]);
+        lval_del(env->vals[i]);
     }
 
-    free(env->entries);
+    free(env->syms);
+    free(env->vals);
     free(env);
 }
 
 
 lval *lenv_get(lenv *env, lval *key) {
     // TODO: We should hash the key to make ~O(1) fetches/inserts
-    int idx = lenv_find_index(env, key);
-
-    entry_t *entry = env->entries[idx];
-
-    if (idx >= 0 && entry && strcmp(entry->key, key->sym) == 0) {
-        return lval_copy(entry->val);
+    for (size_t i = 0; i < env->count; ++i) {
+        /* Return a copy of the value if the key exists */
+        if (strcmp(env->syms[i], key->sym) == 0) {
+            return lval_copy(env->vals[i]);
+        }
     }
 
     /* Nothing found */
@@ -425,11 +341,45 @@ lval *lenv_get(lenv *env, lval *key) {
 }
 
 void lenv_put(lenv *env, lval *key, lval *value) {
-    int idx = lenv_insert_value(env, key, value);
-
-    if (idx == -1) {
-        printf("maaaate");
+    // TODO: We should hash the key to make ~O(1) fetches/inserts
+    for (size_t i = 0; i < env->count; ++i) {
+        /* Return a copy of the value if the key exists */
+        if (strcmp(env->syms[i], key->sym) == 0) {
+            lval_del(env->vals[i]);
+            env->vals[i] = lval_copy(value);
+            return;
+        }
     }
+
+    /* Check for resizing */
+    if (env->count + 1 >= env->capacity) {
+        const size_t oldCap = env->capacity;
+
+        env->capacity *= 1.75;
+
+        const size_t sym_sz = sizeof(char*) * env->capacity;
+        const size_t val_sz = sizeof(lval*) * env->capacity;
+
+        env->syms = (char **)realloc(env->syms, sym_sz);
+        env->vals = (lval **)realloc(env->vals, val_sz);
+
+        memory_allocated += (sym_sz + val_sz) - oldCap;
+
+#ifdef DEBUG
+        printf("values, bytes allocated :: %ld/%ld values, %zu bytes (symbols + values) [%ld bytes total]\n", env->count, 
+            env->capacity, 
+            sym_sz + val_sz, 
+            memory_allocated);
+#endif
+    }
+
+    /* Insert a new value */
+    env->vals[env->count] = lval_copy(value);
+    env->syms[env->count] = (char*)malloc(strlen(key->sym) + 1);
+
+    strcpy(env->syms[env->count], key->sym);
+
+    env->count++;
 }
 
 void lenv_def(lenv *env, lval *key, lval *val) {
@@ -807,7 +757,7 @@ lval *builtin_ord(lenv *env, lval *val, char *op) {
     LASSERT_TYPE(op, val, 0, LVAL_NUM);
     LASSERT_TYPE(op, val, 1, LVAL_NUM);
 
-    int r;
+    int r = 0;
     if (strcmp(op, ">") == 0) {
         r = (val->cell[0]->num > val->cell[1]->num);
     }
@@ -881,7 +831,7 @@ int lval_eq(lval *lhs, lval *rhs) {
 lval *builtin_cmp(lenv *env, lval *val, char *op) {
     LASSERT_NUM(op, val, 2);
 
-    int r;
+    int r = 0;
     if (strcmp(op, "==") == 0) {
         r = lval_eq(val->cell[0], val->cell[1]);
     }
@@ -1183,6 +1133,11 @@ int main(int argc, char **argv) {
     if (argc == 1) {
         while(1) {
             char *input = readline("lispy> ");
+
+            if (input[1] == '\0') {
+                free(input);
+                break;
+            }
 
             mpc_result_t ast;
 
